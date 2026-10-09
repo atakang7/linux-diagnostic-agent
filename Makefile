@@ -1,17 +1,20 @@
-.PHONY: build run test clean receiver
+GO ?= go
+BIN_DIR ?= bin
+
+.PHONY: build run test vet clean
 
 build:
-	CGO_ENABLED=0 go build -o bin/agent cmd/main.go
-	CGO_ENABLED=0 go build -o bin/receiver cmd/receiver/main.go
+	mkdir -p $(BIN_DIR)
+	$(GO) build -o $(BIN_DIR)/agent ./cmd
 
 run:
-	go run cmd/main.go
-
-receiver:
-	go run cmd/receiver/main.go
+	$(GO) run ./cmd
 
 test:
-	go test -v ./...
+	$(GO) test -race -count=1 ./...
+
+vet:
+	$(GO) vet ./...
 
 clean:
-	rm -rf bin/
+	rm -rf $(BIN_DIR)
