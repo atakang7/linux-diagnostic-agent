@@ -446,6 +446,13 @@ func (c *Collector) findLogFiles() ([]LogFile, error) {
 		roots = strings.Split(configured, string(os.PathListSeparator))
 	}
 	var files []LogFile
+	seen := make(map[string]struct{})
+	add := func(file LogFile) {
+		if _, ok := seen[file.Path]; !ok {
+			seen[file.Path] = struct{}{}
+			files = append(files, file)
+		}
+	}
 	for _, root := range roots {
 		if strings.TrimSpace(root) == "" {
 			continue
@@ -453,6 +460,19 @@ func (c *Collector) findLogFiles() ([]LogFile, error) {
 		root, err := filepath.Abs(root)
 		if err != nil {
 			return nil, err
+		}
+		// Represent parent directories so the client's root file tree is
+		// navigable even when the configured root is several levels deep.
+		for parent := filepath.Dir(root); parent != "/" && parent != "."; parent = filepath.Dir(parent) {
+			info, err := os.Stat(parent)
+			if err != nil || !info.IsDir() {
+				continue
+			}
+			add(LogFile{
+				Path: parent, ParentPath: filepath.Dir(parent),
+				Name: filepath.Base(parent), IsDirectory: true,
+				Size: info.Size(), ModTime: info.ModTime(),
+			})
 		}
 		err = filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
 			if walkErr != nil {
@@ -473,7 +493,7 @@ func (c *Collector) findLogFiles() ([]LogFile, error) {
 				return nil
 			}
 			parent := filepath.Dir(path)
-			files = append(files, LogFile{
+			add(LogFile{
 				Path:        path,
 				ParentPath:  parent,
 				Name:        entry.Name(),
