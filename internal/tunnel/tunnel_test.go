@@ -93,7 +93,18 @@ func TestReconnectAndPreservePendingMessages(t *testing.T) {
 	if got := receiveCommand(t, tunnel.Commands()); !strings.Contains(got, "first") {
 		t.Fatalf("unexpected first command: %s", got)
 	}
+	oldConn := tunnel.GetConnection()
 	_ = first.Close()
+	// A successful kernel write to a just-closed socket cannot guarantee
+	// remote delivery. Wait until the read loop detects disconnect before
+	// asserting that a queued message survives reconnection.
+	deadline := time.Now().Add(5 * time.Second)
+	for tunnel.GetConnection() == oldConn && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if tunnel.GetConnection() == oldConn {
+		t.Fatal("old connection was not retired")
+	}
 
 	if err := tunnel.Send(map[string]string{"type": "metrics"}); err != nil {
 		t.Fatal(err)
