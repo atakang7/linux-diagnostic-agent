@@ -8,6 +8,7 @@ import (
 	"log"
 	"strings"
 	"time"
+	"sync"
 
 	"github.com/go-redis/redis/v8"
 	"github.com/google/gopacket"
@@ -114,19 +115,25 @@ func (c *Collector) Close() error {
 
 func (c *Collector) Start(ctx context.Context) {
 	log.Println("Starting network collector...")
-
-	// Start packet capture for each interface
+	var wg sync.WaitGroup
 	for _, iface := range c.interfaces {
-		go c.capturePackets(ctx, iface)
+		wg.Add(1)
+		go func(name string) {
+			defer wg.Done()
+			c.capturePackets(ctx, name)
+		}(iface)
 	}
-
-	// Start continuous batch processor
-	go c.startBatchProcessor(ctx)
-
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		c.startBatchProcessor(ctx)
+	}()
+	<-ctx.Done()
+	wg.Wait()
 }
 
 func (c *Collector) capturePackets(ctx context.Context, iface string) {
-	handle, err := pcap.OpenLive(iface, 1600, false, pcap.BlockForever)
+	handle, err := pcap.OpenLive(iface, 1600, false, 500*time.Millisecond)
 	if err != nil {
 		log.Printf("Failed to open interface %s: %v", iface, err)
 		return
@@ -143,7 +150,10 @@ func (c *Collector) capturePackets(ctx context.Context, iface string) {
 		select {
 		case <-ctx.Done():
 			return
-		case packet := <-packetSource.Packets():
+		case packet, ok := <-packetSource.Packets():
+			if !ok {
+				return
+			}
 			if packet != nil {
 				if err := c.processPacket(ctx, packet); err != nil {
 					log.Printf("Failed to process packet: %v", err)
