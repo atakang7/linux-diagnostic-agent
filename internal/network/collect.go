@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	packetQueue    = "network:packets:queue"   // Raw packets waiting to be processed
+	packetQueue    = "network:packets:queue" // Raw packets waiting to be processed
 	batchSize      = 1000
 	maxQueueLength = 10000
 )
