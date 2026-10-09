@@ -101,11 +101,11 @@ func New(redisAddr string) (*Collector, error) {
 	}, nil
 }
 
-func (c *Collector) Start(ctx context.Context) {
-	if err := c.updateLogFiles(ctx); err != nil {
-		log.Printf("Initial log file discovery failed: %v", err)
-	}
+func (c *Collector) Refresh(ctx context.Context) error {
+	return c.updateLogFiles(ctx)
+}
 
+func (c *Collector) Start(ctx context.Context) {
 	ticker := time.NewTicker(c.updatePeriod)
 	defer ticker.Stop()
 
