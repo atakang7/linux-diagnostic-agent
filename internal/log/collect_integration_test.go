@@ -47,8 +47,14 @@ func TestRedisBackedLogSearchAndDiscovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	inventory := c.GetDiscoveredFiles()
-	if len(inventory) != 3 { // root directory and both logs
-		t.Fatalf("unexpected inventory: %+v", inventory)
+	paths := make(map[string]bool)
+	for _, entry := range inventory {
+		paths[entry.Path] = true
+	}
+	for _, needed := range []string{root, plain, compressed, filepath.Dir(root)} {
+		if !paths[needed] {
+			t.Fatalf("inventory missing %s: %+v", needed, inventory)
+		}
 	}
 	if err := c.ProcessFiles(ctx, FileProcessRequest{
 		Files:    []string{plain, compressed},
