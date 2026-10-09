@@ -67,9 +67,6 @@ type CollectorStats struct {
 	LastError         string
 	LastErrorTime     time.Time
 	CurrentWorkers    int
-	ProcessingSpeed   float64
-	AverageLatency    float64
-	LastMetricsUpdate time.Time
 }
 
 type Collector struct {
@@ -408,14 +405,6 @@ func (c *Collector) updateWorkerCount(count int) {
 	c.statsMutex.Lock()
 	defer c.statsMutex.Unlock()
 	c.stats.CurrentWorkers = count
-}
-
-func (c *Collector) updateMetrics(metrics ProcessingMetrics) {
-	c.statsMutex.Lock()
-	defer c.statsMutex.Unlock()
-	c.stats.ProcessingSpeed = metrics.ProcessingSpeed
-	c.stats.AverageLatency = metrics.BatchLatency
-	c.stats.LastMetricsUpdate = time.Now()
 }
 
 func (c *Collector) GetStats() CollectorStats {
