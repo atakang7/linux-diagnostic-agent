@@ -62,7 +62,7 @@ func TestAgentInventoryCommandAndLogDelivery(t *testing.T) {
 	sent := false
 	for {
 		var event struct {
-			Type string `json:"type"`
+			Type    string          `json:"type"`
 			Payload json.RawMessage `json:"payload"`
 		}
 		if err := decoder.Decode(&event); err != nil {
@@ -97,7 +97,7 @@ func TestAgentInventoryCommandAndLogDelivery(t *testing.T) {
 			sent = true
 		case "log_data":
 			var rows []struct {
-				Line string `json:"line"`
+				Line  string `json:"line"`
 				Level string `json:"level"`
 			}
 			if err := json.Unmarshal(event.Payload, &rows); err != nil {
