@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -213,9 +214,20 @@ func (c *Collector) processFile(ctx context.Context, filePath string, keywords [
 	}
 	defer file.Close()
 
+	var reader io.Reader = file
+	if strings.HasSuffix(strings.ToLower(filePath), ".gz") {
+		gz, err := gzip.NewReader(file)
+		if err != nil {
+			return fmt.Errorf("open compressed log: %w", err)
+		}
+		defer gz.Close()
+		reader = gz
+	}
+
 	var batch []LogEntry
 	lineNum := 0
-	scanner := bufio.NewScanner(file)
+	var bytesScanned int
+	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, chunkSize), chunkSize)
 
 	// Expensive search
@@ -226,6 +238,7 @@ func (c *Collector) processFile(ctx context.Context, filePath string, keywords [
 		default:
 			lineNum++
 			line := scanner.Text()
+			bytesScanned += len(line)
 
 			for _, keyword := range keywords {
 				if strings.Contains(line, keyword) {
@@ -242,7 +255,7 @@ func (c *Collector) processFile(ctx context.Context, filePath string, keywords [
 
 			if len(batch) >= maxBatchSize {
 				if err := c.bufferBatch(ctx, batch, searchID); err != nil {
-					log.Printf("Failed to buffer batch: %v", err)
+					return fmt.Errorf("buffer log batch: %w", err)
 				}
 				batch = make([]LogEntry, 0, maxBatchSize)
 			}
@@ -252,11 +265,11 @@ func (c *Collector) processFile(ctx context.Context, filePath string, keywords [
 	// Buffer remaining entries
 	if len(batch) > 0 {
 		if err := c.bufferBatch(ctx, batch, searchID); err != nil {
-			log.Printf("Failed to buffer final batch: %v", err)
+			return fmt.Errorf("buffer final log batch: %w", err)
 		}
 	}
 
-	c.updateStats(lineNum, len(batch))
+	c.updateStats(lineNum, bytesScanned)
 	return scanner.Err()
 }
 
@@ -273,9 +286,12 @@ func (c *Collector) bufferBatch(ctx context.Context, entries []LogEntry, searchI
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
 	if err := json.NewEncoder(gz).Encode(entries); err != nil {
+		_ = gz.Close()
 		return fmt.Errorf("failed to encode entries: %w", err)
 	}
-	gz.Close()
+	if err := gz.Close(); err != nil {
+		return fmt.Errorf("finish compressed batch: %w", err)
+	}
 
 	key := fmt.Sprintf("%s:results", searchID)
 	if err := c.redisClient.RPush(ctx, key, buf.Bytes()).Err(); err != nil {
@@ -290,28 +306,24 @@ func (c *Collector) bufferBatch(ctx context.Context, entries []LogEntry, searchI
 func (c *Collector) startConsumer(ctx context.Context, searchID string) {
 	throttle := time.NewTicker(deliveryRateLimit)
 	defer throttle.Stop()
-
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-throttle.C:
 			entries, err := c.consumeBatch(ctx, searchID)
-			if err != nil {
-				if err != redis.Nil {
-					log.Printf("Error consuming batch: %v", err)
-				}
-				continue
+			if err == redis.Nil {
+				return // all buffered search results delivered; no lingering goroutine
 			}
-
-			if len(entries) > 0 {
-				select {
-				case c.logChan <- entries:
-					c.updateDeliveryStats(len(entries))
-				default:
-					log.Printf("Channel full, requeueing batch")
-					c.bufferBatch(ctx, entries, searchID)
-				}
+			if err != nil {
+				log.Printf("[LOG] failed to deliver search batch: %v", err)
+				return
+			}
+			select {
+			case c.logChan <- entries:
+				c.updateDeliveryStats(len(entries))
+			case <-ctx.Done():
+				return
 			}
 		}
 	}
@@ -346,9 +358,11 @@ func (c *Collector) updateLogFiles(ctx context.Context) error {
 	}
 
 	c.mutex.Lock()
+	inventory := make(map[string]LogFile, len(files))
 	for _, file := range files {
-		c.knownFiles[file.Path] = file
+		inventory[file.Path] = file
 	}
+	c.knownFiles = inventory
 	c.lastUpdate = time.Now()
 	c.mutex.Unlock()
 
@@ -432,7 +446,7 @@ func (c *Collector) GetDiscoveredFiles() []LogFile {
 // Helper functions for system metrics
 func isLogFile(path string) bool {
 	ext := strings.ToLower(filepath.Ext(path))
-	return ext == ".log" || ext == ".txt" || strings.Contains(path, "/log/") || strings.Contains(path, "/logs/")
+	return ext == ".log" || ext == ".txt" || strings.HasSuffix(strings.ToLower(path), ".log.gz")
 }
 
 func (c *Collector) findLogFiles() ([]LogFile, error) {
