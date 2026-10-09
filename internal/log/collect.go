@@ -59,15 +59,15 @@ type FileProcessRequest struct {
 }
 
 type CollectorStats struct {
-	ProcessedFiles    int64
-	ProcessedLines    int64
-	BytesProcessed    int64
-	BufferedBatches   int64
-	DeliveredBatches  int64
-	Errors            int64
-	LastError         string
-	LastErrorTime     time.Time
-	CurrentWorkers    int
+	ProcessedFiles   int64
+	ProcessedLines   int64
+	BytesProcessed   int64
+	BufferedBatches  int64
+	DeliveredBatches int64
+	Errors           int64
+	LastError        string
+	LastErrorTime    time.Time
+	CurrentWorkers   int
 }
 
 type Collector struct {
@@ -141,10 +141,10 @@ func (c *Collector) ProcessFiles(ctx context.Context, req FileProcessRequest) er
 	searchID := fmt.Sprintf("search:%d", time.Now().UnixNano())
 	metaKey := searchID + ":meta"
 	meta := map[string]interface{}{
-		"status": "processing",
+		"status":     "processing",
 		"start_time": time.Now().UTC().Format(time.RFC3339),
-		"files": strings.Join(req.Files, ","),
-		"keywords": strings.Join(req.Keywords, ","),
+		"files":      strings.Join(req.Files, ","),
+		"keywords":   strings.Join(req.Keywords, ","),
 	}
 	if err := c.redisClient.HSet(ctx, metaKey, meta).Err(); err != nil {
 		return fmt.Errorf("store search metadata: %w", err)
@@ -194,9 +194,9 @@ func (c *Collector) ProcessFiles(ctx context.Context, req FileProcessRequest) er
 		status = "failed"
 	}
 	_ = c.redisClient.HSet(ctx, metaKey, map[string]interface{}{
-		"status": status,
+		"status":   status,
 		"end_time": time.Now().UTC().Format(time.RFC3339),
-		"errors": strings.Join(failures, "; "),
+		"errors":   strings.Join(failures, "; "),
 	}).Err()
 	go c.startConsumer(ctx, searchID)
 	if len(failures) > 0 {
@@ -474,13 +474,13 @@ func (c *Collector) findLogFiles() ([]LogFile, error) {
 			}
 			parent := filepath.Dir(path)
 			files = append(files, LogFile{
-				Path: path,
-				ParentPath: parent,
-				Name: entry.Name(),
+				Path:        path,
+				ParentPath:  parent,
+				Name:        entry.Name(),
 				IsDirectory: entry.IsDir(),
-				Size: info.Size(),
-				ModTime: info.ModTime(),
-				IsGzipped: strings.HasSuffix(strings.ToLower(path), ".gz"),
+				Size:        info.Size(),
+				ModTime:     info.ModTime(),
+				IsGzipped:   strings.HasSuffix(strings.ToLower(path), ".gz"),
 			})
 			return nil
 		})
