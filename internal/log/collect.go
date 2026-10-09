@@ -91,6 +91,7 @@ func New(redisAddr string) (*Collector, error) {
 	defer cancel()
 
 	if err := rdb.Ping(ctx).Err(); err != nil {
+		_ = rdb.Close()
 		return nil, fmt.Errorf("redis connection failed: %w", err)
 	}
 
@@ -100,6 +101,10 @@ func New(redisAddr string) (*Collector, error) {
 		knownFiles:   make(map[string]LogFile),
 		updatePeriod: 1 * time.Minute,
 	}, nil
+}
+
+func (c *Collector) Close() error {
+	return c.redisClient.Close()
 }
 
 func (c *Collector) Refresh(ctx context.Context) error {
