@@ -5,9 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
-	"strings"
 	"sync"
 	"time"
 
@@ -64,6 +62,7 @@ func New(hostAddr, redisAddr string) (*Agent, error) {
 
 	logCollector, err := logcollect.New(redisAddr)
 	if err != nil {
+		_ = networkCollector.Close()
 		return nil, fmt.Errorf("failed to create log collector: %w", err)
 	}
 
@@ -92,10 +91,26 @@ func (a *Agent) Run(ctx context.Context) error {
 		return fmt.Errorf("failed to connect tunnel: %w", err)
 	}
 	defer a.tunnel.Close()
+	defer a.logCollector.Close()
+	defer a.networkCollector.Close()
+
+	// The initial inventory must exist before the first log_list and before
+	// processing remote searches; otherwise the first update may take minutes.
+	if err := a.logCollector.Refresh(ctx); err != nil {
+		return fmt.Errorf("discover initial logs: %w", err)
+	}
 
 	log.Println("Starting collectors...")
-	go a.logCollector.Start(ctx)
-	go a.networkCollector.Start(ctx)
+	var collectors sync.WaitGroup
+	collectors.Add(2)
+	go func() {
+		defer collectors.Done()
+		a.logCollector.Start(ctx)
+	}()
+	go func() {
+		defer collectors.Done()
+		a.networkCollector.Start(ctx)
+	}()
 	var wg sync.WaitGroup
 	wg.Add(3)
 
@@ -115,78 +130,44 @@ func (a *Agent) Run(ctx context.Context) error {
 	}()
 
 	wg.Wait()
+	collectors.Wait()
 	return nil
 }
 
 func (a *Agent) handleCommands(ctx context.Context) {
-	log.Println("[AGENT] Starting command handler")
-
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		default:
-			decoder := a.tunnel.GetDecoder()
-			if decoder == nil {
-				log.Println("[AGENT] No decoder available, waiting...")
-				time.Sleep(time.Second)
-				continue
-			}
-
-			if conn := a.tunnel.GetConnection(); conn != nil {
-				conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-			}
-
-			// Read the raw message first
-			var rawMsg json.RawMessage
-			if err := decoder.Decode(&rawMsg); err != nil {
-				if err == io.EOF || strings.Contains(err.Error(), "i/o timeout") {
-					continue
-				}
-				log.Printf("[AGENT][ERROR] Failed to decode raw message: %v", err)
-				// Add debug information
-				if len(rawMsg) > 0 {
-					log.Printf("[AGENT][DEBUG] Raw message content: %s", string(rawMsg))
-				}
-				continue
-			}
-
-			fmt.Print("Received command... ", string(rawMsg))
-
+		case raw := <-a.tunnel.Commands():
 			var msg struct {
-				Type    string          `json:"type"`
+				Type    MessageType     `json:"type"`
 				Payload json.RawMessage `json:"payload"`
 			}
-
-			if err := json.Unmarshal(rawMsg, &msg); err != nil {
-				log.Printf("[AGENT][ERROR] Failed to parse message structure: %v", err)
-				log.Printf("[AGENT][DEBUG] Raw message: %s", string(rawMsg))
+			if err := json.Unmarshal(raw, &msg); err != nil {
+				log.Printf("[AGENT] invalid command: %v", err)
 				continue
 			}
-
-			// Convert string type to MessageType
-			msgType := MessageType(msg.Type)
-			log.Printf("[AGENT] Received command type: %s", msgType)
-
-			switch msgType {
+			switch msg.Type {
 			case TypeLogSearch:
-				fmt.Print("LOg search request revieved...")
-				var searchCmd LogSearchCommand
-				if err := json.Unmarshal(msg.Payload, &searchCmd); err != nil {
-					log.Printf("[AGENT][ERROR] Failed to parse search command: %v", err)
-					log.Printf("[AGENT][DEBUG] Command payload: %s", string(msg.Payload))
+				var cmd LogSearchCommand
+				if err := json.Unmarshal(msg.Payload, &cmd); err != nil {
 					a.recordError(err)
 					continue
 				}
-
-				log.Printf("[AGENT] Processing search for files: %v", searchCmd.Files)
-				a.handleSearchCommand(ctx, searchCmd)
+				if len(cmd.Files) == 0 || len(cmd.Files) > 128 ||
+					len(cmd.Keywords) == 0 || len(cmd.Keywords) > 16 {
+					log.Printf("[AGENT] rejecting log search with invalid file/keyword count")
+					continue
+				}
+				a.handleSearchCommand(ctx, cmd)
 			default:
-				log.Printf("[AGENT] Ignoring unknown command type: %s", msgType)
+				log.Printf("[AGENT] ignoring unsupported command: %s", msg.Type)
 			}
 		}
 	}
 }
+
 func (a *Agent) handleSearchCommand(ctx context.Context, cmd LogSearchCommand) {
 	a.updateStats(func(s *AgentStats) {
 		s.ActiveSearches++
@@ -198,7 +179,7 @@ func (a *Agent) handleSearchCommand(ctx context.Context, cmd LogSearchCommand) {
 		defer a.updateStats(func(s *AgentStats) {
 			s.ActiveSearches--
 		})
-		fmt.Print("Processing search... ", cmd.Files, cmd.Keywords)
+		log.Printf("[AGENT] searching %d files", len(cmd.Files))
 		req := logcollect.FileProcessRequest{
 			Files:    cmd.Files,
 			Keywords: cmd.Keywords,

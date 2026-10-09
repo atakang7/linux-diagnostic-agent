@@ -7,11 +7,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -25,28 +24,7 @@ const (
 	deliveryRateLimit    = 1 * time.Second // Time between sending batches to client
 	redisKeyExpiry       = 24 * time.Hour  // How long to keep results in Redis
 	defaultChannelBuffer = 200             // Default size for the log channel buffer
-	metricsInterval      = 2 * time.Second // Interval for collecting metrics
-	memoryThreshold      = 80.0            // Maximum memory usage percentage
-	cpuThreshold         = 80.0            // Maximum CPU usage percentage
-	latencyThreshold     = 1.3             // Maximum latency increase factor
 )
-
-type ProcessingMetrics struct {
-	ProcessingSpeed float64 // lines per second
-	MemoryUsage     float64 // percentage
-	CPUUsage        float64 // percentage
-	BatchLatency    float64 // milliseconds
-	ErrorRate       float64 // percentage
-	Timestamp       time.Time
-}
-
-type ScalingController struct {
-	currentWorkers int
-	maxWorkers     int
-	metrics        []ProcessingMetrics
-	mutex          sync.RWMutex
-	threshold      float64
-}
 
 type LogFile struct {
 	Path        string    `json:"path"`
@@ -72,6 +50,7 @@ type LogEntry struct {
 	LineNum   int              `json:"line_num"`
 	Timestamp time.Time        `json:"timestamp"`
 	Type      NotificationType `json:"notification_type"`
+	Level     string           `json:"level"`
 }
 
 type FileProcessRequest struct {
@@ -80,18 +59,15 @@ type FileProcessRequest struct {
 }
 
 type CollectorStats struct {
-	ProcessedFiles    int64
-	ProcessedLines    int64
-	BytesProcessed    int64
-	BufferedBatches   int64
-	DeliveredBatches  int64
-	Errors            int64
-	LastError         string
-	LastErrorTime     time.Time
-	CurrentWorkers    int
-	ProcessingSpeed   float64
-	AverageLatency    float64
-	LastMetricsUpdate time.Time
+	ProcessedFiles   int64
+	ProcessedLines   int64
+	BytesProcessed   int64
+	BufferedBatches  int64
+	DeliveredBatches int64
+	Errors           int64
+	LastError        string
+	LastErrorTime    time.Time
+	CurrentWorkers   int
 }
 
 type Collector struct {
@@ -103,7 +79,6 @@ type Collector struct {
 	updatePeriod time.Duration
 	stats        CollectorStats
 	statsMutex   sync.RWMutex
-	controller   *ScalingController
 }
 
 func New(redisAddr string) (*Collector, error) {
@@ -116,6 +91,7 @@ func New(redisAddr string) (*Collector, error) {
 	defer cancel()
 
 	if err := rdb.Ping(ctx).Err(); err != nil {
+		_ = rdb.Close()
 		return nil, fmt.Errorf("redis connection failed: %w", err)
 	}
 
@@ -124,18 +100,18 @@ func New(redisAddr string) (*Collector, error) {
 		logChan:      make(chan []LogEntry, defaultChannelBuffer),
 		knownFiles:   make(map[string]LogFile),
 		updatePeriod: 1 * time.Minute,
-		controller: &ScalingController{
-			currentWorkers: 1,
-			threshold:      0.7,
-		},
 	}, nil
 }
 
-func (c *Collector) Start(ctx context.Context) {
-	if err := c.updateLogFiles(ctx); err != nil {
-		log.Printf("Initial log file discovery failed: %v", err)
-	}
+func (c *Collector) Close() error {
+	return c.redisClient.Close()
+}
 
+func (c *Collector) Refresh(ctx context.Context) error {
+	return c.updateLogFiles(ctx)
+}
+
+func (c *Collector) Start(ctx context.Context) {
 	ticker := time.NewTicker(c.updatePeriod)
 	defer ticker.Stop()
 
@@ -152,96 +128,85 @@ func (c *Collector) Start(ctx context.Context) {
 }
 
 func (c *Collector) ProcessFiles(ctx context.Context, req FileProcessRequest) error {
-	searchID := fmt.Sprintf("search:%d", time.Now().UnixNano())
+	if len(req.Files) == 0 || len(req.Files) > 128 || len(req.Keywords) == 0 || len(req.Keywords) > 16 {
+		return fmt.Errorf("search requires 1-128 files and 1-16 keywords")
+	}
+	// Only files discovered under configured log roots may be queried by the
+	// remote service. Never open arbitrary requested paths.
+	c.mutex.RLock()
+	for _, path := range req.Files {
+		entry, ok := c.knownFiles[path]
+		if !ok || entry.IsDirectory {
+			c.mutex.RUnlock()
+			return fmt.Errorf("file is not in the discovered log inventory: %s", path)
+		}
+	}
+	c.mutex.RUnlock()
 
-	// Initialize search metadata
-	searchMeta := map[string]interface{}{
+	searchID := fmt.Sprintf("search:%d", time.Now().UnixNano())
+	metaKey := searchID + ":meta"
+	meta := map[string]interface{}{
 		"status":     "processing",
-		"start_time": time.Now().Format(time.RFC3339),
+		"start_time": time.Now().UTC().Format(time.RFC3339),
 		"files":      strings.Join(req.Files, ","),
 		"keywords":   strings.Join(req.Keywords, ","),
 	}
-
-	if err := c.redisClient.HSet(ctx, fmt.Sprintf("%s:meta", searchID), searchMeta).Err(); err != nil {
-		return fmt.Errorf("failed to store search metadata: %w", err)
+	if err := c.redisClient.HSet(ctx, metaKey, meta).Err(); err != nil {
+		return fmt.Errorf("store search metadata: %w", err)
 	}
+	_ = c.redisClient.Expire(ctx, metaKey, redisKeyExpiry).Err()
 
-	// Update controller max workers
-	c.controller.maxWorkers = len(req.Files)
-
-	// Create work queue
-	fileQueue := make(chan string, len(req.Files))
-	for _, file := range req.Files {
-		fileQueue <- file
+	// Bounded per-search workers avoid races between concurrent requests.
+	workers := len(req.Files)
+	if workers > 4 {
+		workers = 4
 	}
-	close(fileQueue)
-
-	// Start metrics collection
-	metricsDone := make(chan struct{})
-	go c.controller.collectMetrics(ctx, c, metricsDone)
-
+	c.updateWorkerCount(workers)
+	queue := make(chan string)
+	errs := make(chan error, len(req.Files))
 	var wg sync.WaitGroup
-	errChan := make(chan error, len(req.Files))
-
-	// Initial worker
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for filePath := range fileQueue {
-			if err := c.processFile(ctx, filePath, req.Keywords, searchID); err != nil {
-				errChan <- fmt.Errorf("error processing %s: %w", filePath, err)
-				continue
-			}
-
-			if c.controller.shouldScaleUp() {
-				c.controller.mutex.Lock()
-				if c.controller.currentWorkers < c.controller.maxWorkers {
-					c.controller.currentWorkers++
-					c.updateWorkerCount(c.controller.currentWorkers)
-					wg.Add(1)
-					go func() {
-						defer wg.Done()
-						for filePath := range fileQueue {
-							if err := c.processFile(ctx, filePath, req.Keywords, searchID); err != nil {
-								errChan <- fmt.Errorf("error processing %s: %w", filePath, err)
-							}
-						}
-					}()
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for name := range queue {
+				if err := c.processFile(ctx, name, req.Keywords, searchID); err != nil {
+					errs <- fmt.Errorf("process %s: %w", name, err)
 				}
-				c.controller.mutex.Unlock()
 			}
+		}()
+	}
+	for _, name := range req.Files {
+		select {
+		case <-ctx.Done():
+			close(queue)
+			wg.Wait()
+			return ctx.Err()
+		case queue <- name:
 		}
-	}()
-
+	}
+	close(queue)
 	wg.Wait()
-	close(errChan)
-	close(metricsDone)
+	close(errs)
 
-	// Collect errors
-	var errors []string
-	for err := range errChan {
-		errors = append(errors, err.Error())
+	var failures []string
+	for err := range errs {
+		failures = append(failures, err.Error())
 		c.recordError(err.Error())
 	}
-
-	// Update search metadata
-	searchMeta["end_time"] = time.Now().Format(time.RFC3339)
-	searchMeta["status"] = "completed"
-	if len(errors) > 0 {
-		searchMeta["errors"] = strings.Join(errors, "; ")
+	status := "completed"
+	if len(failures) > 0 {
+		status = "failed"
 	}
-
-	if err := c.redisClient.HSet(ctx, fmt.Sprintf("%s:meta", searchID), searchMeta).Err(); err != nil {
-		log.Printf("Failed to update search metadata: %v", err)
-	}
-
-	// Start the consumer
+	_ = c.redisClient.HSet(ctx, metaKey, map[string]interface{}{
+		"status":   status,
+		"end_time": time.Now().UTC().Format(time.RFC3339),
+		"errors":   strings.Join(failures, "; "),
+	}).Err()
 	go c.startConsumer(ctx, searchID)
-
-	if len(errors) > 0 {
-		return fmt.Errorf("processing errors: %s", strings.Join(errors, "; "))
+	if len(failures) > 0 {
+		return fmt.Errorf("search errors: %s", strings.Join(failures, "; "))
 	}
-
 	return nil
 }
 
@@ -252,9 +217,20 @@ func (c *Collector) processFile(ctx context.Context, filePath string, keywords [
 	}
 	defer file.Close()
 
+	var reader io.Reader = file
+	if strings.HasSuffix(strings.ToLower(filePath), ".gz") {
+		gz, err := gzip.NewReader(file)
+		if err != nil {
+			return fmt.Errorf("open compressed log: %w", err)
+		}
+		defer gz.Close()
+		reader = gz
+	}
+
 	var batch []LogEntry
 	lineNum := 0
-	scanner := bufio.NewScanner(file)
+	var bytesScanned int
+	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, chunkSize), chunkSize)
 
 	// Expensive search
@@ -265,6 +241,7 @@ func (c *Collector) processFile(ctx context.Context, filePath string, keywords [
 		default:
 			lineNum++
 			line := scanner.Text()
+			bytesScanned += len(line)
 
 			for _, keyword := range keywords {
 				if strings.Contains(line, keyword) {
@@ -274,6 +251,7 @@ func (c *Collector) processFile(ctx context.Context, filePath string, keywords [
 						LineNum:   lineNum,
 						Timestamp: time.Now(),
 						Type:      getNotificationType(keyword),
+						Level:     string(getNotificationType(keyword)),
 					})
 					break
 				}
@@ -281,7 +259,7 @@ func (c *Collector) processFile(ctx context.Context, filePath string, keywords [
 
 			if len(batch) >= maxBatchSize {
 				if err := c.bufferBatch(ctx, batch, searchID); err != nil {
-					log.Printf("Failed to buffer batch: %v", err)
+					return fmt.Errorf("buffer log batch: %w", err)
 				}
 				batch = make([]LogEntry, 0, maxBatchSize)
 			}
@@ -291,18 +269,18 @@ func (c *Collector) processFile(ctx context.Context, filePath string, keywords [
 	// Buffer remaining entries
 	if len(batch) > 0 {
 		if err := c.bufferBatch(ctx, batch, searchID); err != nil {
-			log.Printf("Failed to buffer final batch: %v", err)
+			return fmt.Errorf("buffer final log batch: %w", err)
 		}
 	}
 
-	c.updateStats(lineNum, len(batch))
+	c.updateStats(lineNum, bytesScanned)
 	return scanner.Err()
 }
 
 func getNotificationType(keyword string) NotificationType {
-	if keyword == "error" {
+	if strings.EqualFold(keyword, "error") {
 		return Error
-	} else if keyword == "warning" {
+	} else if strings.EqualFold(keyword, "warning") {
 		return Warning
 	}
 	return Other
@@ -312,9 +290,12 @@ func (c *Collector) bufferBatch(ctx context.Context, entries []LogEntry, searchI
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
 	if err := json.NewEncoder(gz).Encode(entries); err != nil {
+		_ = gz.Close()
 		return fmt.Errorf("failed to encode entries: %w", err)
 	}
-	gz.Close()
+	if err := gz.Close(); err != nil {
+		return fmt.Errorf("finish compressed batch: %w", err)
+	}
 
 	key := fmt.Sprintf("%s:results", searchID)
 	if err := c.redisClient.RPush(ctx, key, buf.Bytes()).Err(); err != nil {
@@ -329,28 +310,24 @@ func (c *Collector) bufferBatch(ctx context.Context, entries []LogEntry, searchI
 func (c *Collector) startConsumer(ctx context.Context, searchID string) {
 	throttle := time.NewTicker(deliveryRateLimit)
 	defer throttle.Stop()
-
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-throttle.C:
 			entries, err := c.consumeBatch(ctx, searchID)
-			if err != nil {
-				if err != redis.Nil {
-					log.Printf("Error consuming batch: %v", err)
-				}
-				continue
+			if err == redis.Nil {
+				return // all buffered search results delivered; no lingering goroutine
 			}
-
-			if len(entries) > 0 {
-				select {
-				case c.logChan <- entries:
-					c.updateDeliveryStats(len(entries))
-				default:
-					log.Printf("Channel full, requeueing batch")
-					c.bufferBatch(ctx, entries, searchID)
-				}
+			if err != nil {
+				log.Printf("[LOG] failed to deliver search batch: %v", err)
+				return
+			}
+			select {
+			case c.logChan <- entries:
+				c.updateDeliveryStats(len(entries))
+			case <-ctx.Done():
+				return
 			}
 		}
 	}
@@ -385,9 +362,11 @@ func (c *Collector) updateLogFiles(ctx context.Context) error {
 	}
 
 	c.mutex.Lock()
+	inventory := make(map[string]LogFile, len(files))
 	for _, file := range files {
-		c.knownFiles[file.Path] = file
+		inventory[file.Path] = file
 	}
+	c.knownFiles = inventory
 	c.lastUpdate = time.Now()
 	c.mutex.Unlock()
 
@@ -399,68 +378,6 @@ func (c *Collector) updateLogFiles(ctx context.Context) error {
 	gz.Close()
 
 	return c.redisClient.Set(ctx, "log_files", buf.Bytes(), redisKeyExpiry).Err()
-}
-
-func (sc *ScalingController) collectMetrics(ctx context.Context, c *Collector, done chan struct{}) {
-	ticker := time.NewTicker(metricsInterval)
-	defer ticker.Stop()
-
-	var lastStats CollectorStats
-	var lastTime time.Time
-
-	for {
-		select {
-		case <-done:
-			return
-		case <-ticker.C:
-			currentStats := c.GetStats()
-			currentTime := time.Now()
-
-			if !lastTime.IsZero() {
-				timeDiff := currentTime.Sub(lastTime).Seconds()
-				metrics := ProcessingMetrics{
-					ProcessingSpeed: float64(currentStats.ProcessedLines-lastStats.ProcessedLines) / timeDiff,
-					BatchLatency:    float64(currentStats.BufferedBatches-lastStats.BufferedBatches) / float64(currentStats.DeliveredBatches-lastStats.DeliveredBatches),
-					ErrorRate:       float64(currentStats.Errors-lastStats.Errors) / float64(currentStats.ProcessedLines-lastStats.ProcessedLines),
-					Timestamp:       currentTime,
-				}
-
-				metrics.MemoryUsage = getMemoryUsage()
-				metrics.CPUUsage = getCPUUsage()
-
-				sc.mutex.Lock()
-				sc.metrics = append(sc.metrics, metrics)
-				if len(sc.metrics) > 5 {
-					sc.metrics = sc.metrics[1:]
-				}
-				sc.mutex.Unlock()
-
-				c.updateMetrics(metrics)
-			}
-
-			lastStats = currentStats
-			lastTime = currentTime
-		}
-	}
-}
-
-func (sc *ScalingController) shouldScaleUp() bool {
-	sc.mutex.RLock()
-	defer sc.mutex.RUnlock()
-
-	if len(sc.metrics) < 2 {
-		return true
-	}
-
-	current := sc.metrics[len(sc.metrics)-1]
-	previous := sc.metrics[len(sc.metrics)-2]
-
-	speedImprovement := (current.ProcessingSpeed - previous.ProcessingSpeed) / previous.ProcessingSpeed
-	memoryOK := current.MemoryUsage < memoryThreshold
-	cpuOK := current.CPUUsage < cpuThreshold
-	latencyOK := current.BatchLatency < previous.BatchLatency*latencyThreshold
-
-	return speedImprovement > 0 && memoryOK && cpuOK && latencyOK
 }
 
 func (c *Collector) updateStats(lineCount, batchSize int) {
@@ -497,14 +414,6 @@ func (c *Collector) updateWorkerCount(count int) {
 	c.stats.CurrentWorkers = count
 }
 
-func (c *Collector) updateMetrics(metrics ProcessingMetrics) {
-	c.statsMutex.Lock()
-	defer c.statsMutex.Unlock()
-	c.stats.ProcessingSpeed = metrics.ProcessingSpeed
-	c.stats.AverageLatency = metrics.BatchLatency
-	c.stats.LastMetricsUpdate = time.Now()
-}
-
 func (c *Collector) GetStats() CollectorStats {
 	c.statsMutex.RLock()
 	defer c.statsMutex.RUnlock()
@@ -531,84 +440,78 @@ func (c *Collector) GetDiscoveredFiles() []LogFile {
 }
 
 // Helper functions for system metrics
-func getMemoryUsage() float64 {
-	var m runtime.MemStats
-	runtime.ReadMemStats(&m)
-	return float64(m.Alloc) / float64(m.Sys) * 100
-}
-
-func getCPUUsage() float64 {
-	// In production, replace with proper CPU monitoring
-	// Example: use github.com/shirou/gopsutil
-	return 0
-}
-
-// Helper functions for file operations
 func isLogFile(path string) bool {
 	ext := strings.ToLower(filepath.Ext(path))
-	return ext == ".log" || ext == ".txt" || strings.Contains(path, "/log/") || strings.Contains(path, "/logs/")
-}
-
-func isReadable(path string) bool {
-	file, err := os.Open(path)
-	if err != nil {
-		return false
-	}
-	file.Close()
-	return true
+	return ext == ".log" || ext == ".txt" || strings.HasSuffix(strings.ToLower(path), ".log.gz")
 }
 
 func (c *Collector) findLogFiles() ([]LogFile, error) {
-	cmd := exec.Command("locate", "-i", "--regex", "\\.log$|\\.log\\.gz$|/log/.*\\.txt$")
-	fmt.Print("Locating log files... ")
-	output, err := cmd.Output()
-	if err != nil {
-		return nil, fmt.Errorf("locate command failed: %w", err)
+	roots := []string{"/var/log"}
+	if configured := os.Getenv("LOG_ROOTS"); configured != "" {
+		roots = strings.Split(configured, string(os.PathListSeparator))
 	}
-
 	var files []LogFile
-	scanner := bufio.NewScanner(bytes.NewReader(output))
-
-	for scanner.Scan() {
-		path := scanner.Text()
-		if info, err := os.Stat(path); err == nil {
-			if isLogFile(path) && isReadable(path) {
-				parentPath := filepath.Dir(path)
-				if parentPath == path {
-					parentPath = ""
-				}
-
-				files = append(files, LogFile{
-					Path:        path,
-					ParentPath:  parentPath,
-					Name:        filepath.Base(path),
-					IsDirectory: info.IsDir(),
-					Size:        info.Size(),
-					ModTime:     info.ModTime(),
-					IsGzipped:   strings.HasSuffix(path, ".gz"),
-				})
-
-				if info.IsDir() && parentPath != "" {
-					if parentInfo, err := os.Stat(parentPath); err == nil {
-						parentParentPath := filepath.Dir(parentPath)
-						if parentParentPath == parentPath {
-							parentParentPath = ""
-						}
-
-						files = append(files, LogFile{
-							Path:        parentPath,
-							ParentPath:  parentParentPath,
-							Name:        filepath.Base(parentPath),
-							IsDirectory: true,
-							Size:        parentInfo.Size(),
-							ModTime:     parentInfo.ModTime(),
-							IsGzipped:   false,
-						})
-					}
-				}
-			}
+	seen := make(map[string]struct{})
+	add := func(file LogFile) {
+		if _, ok := seen[file.Path]; !ok {
+			seen[file.Path] = struct{}{}
+			files = append(files, file)
 		}
 	}
-
+	for _, root := range roots {
+		if strings.TrimSpace(root) == "" {
+			continue
+		}
+		root, err := filepath.Abs(root)
+		if err != nil {
+			return nil, err
+		}
+		// Represent parent directories so the client's root file tree is
+		// navigable even when the configured root is several levels deep.
+		for parent := filepath.Dir(root); parent != "/" && parent != "."; parent = filepath.Dir(parent) {
+			info, err := os.Stat(parent)
+			if err != nil || !info.IsDir() {
+				continue
+			}
+			add(LogFile{
+				Path: parent, ParentPath: filepath.Dir(parent),
+				Name: filepath.Base(parent), IsDirectory: true,
+				Size: info.Size(), ModTime: info.ModTime(),
+			})
+		}
+		err = filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				if path == root {
+					return walkErr
+				}
+				log.Printf("[LOG] skipping inaccessible path %s: %v", path, walkErr)
+				return nil
+			}
+			if entry.Type()&os.ModeSymlink != 0 {
+				return nil
+			}
+			if !entry.IsDir() && (!entry.Type().IsRegular() || !isLogFile(path)) {
+				return nil
+			}
+			info, err := entry.Info()
+			if err != nil {
+				return nil
+			}
+			parent := filepath.Dir(path)
+			add(LogFile{
+				Path:        path,
+				ParentPath:  parent,
+				Name:        entry.Name(),
+				IsDirectory: entry.IsDir(),
+				Size:        info.Size(),
+				ModTime:     info.ModTime(),
+				IsGzipped:   strings.HasSuffix(strings.ToLower(path), ".gz"),
+			})
+			return nil
+		})
+		if err != nil {
+			return nil, fmt.Errorf("discover logs under %s: %w", root, err)
+		}
+	}
 	return files, nil
 }

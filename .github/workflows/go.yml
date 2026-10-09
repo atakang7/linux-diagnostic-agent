@@ -11,19 +11,43 @@ permissions:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 15
+
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install libpcap headers
         run: |
           sudo apt-get update
           sudo apt-get install -y libpcap-dev
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
+      - name: Format
+        run: |
+          files="$(gofmt -l ./cmd ./internal)"
+          if [ -n "$files" ]; then
+            printf 'Go files require formatting:\n%s\n' "$files"
+            exit 1
+          fi
+      - name: Dependency integrity
+        run: |
+          go mod verify
+          go mod tidy -diff
       - name: Build
         run: make build
       - name: Vet
-        run: make vet
-      - name: Test with race detector
-        run: make test
+        run: go vet ./...
+      - name: Unit tests with race detection
+        run: go test -race -count=1 ./...
+      - name: Redis and TCP integration tests
+        run: go test -race -tags=integration -count=1 -v ./...

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-redis/redis/v8"
@@ -17,8 +18,7 @@ import (
 )
 
 const (
-	packetQueue    = "network:packets:queue"   // Raw packets waiting to be processed
-	processedQueue = "network:processed:queue" // Processed metrics ready for client consumption
+	packetQueue    = "network:packets:queue" // Raw packets waiting to be processed
 	batchSize      = 1000
 	maxQueueLength = 10000
 )
@@ -84,6 +84,7 @@ func New(redisAddr string) (*Collector, error) {
 	defer cancel()
 
 	if err := rdb.Ping(ctx).Err(); err != nil {
+		_ = rdb.Close()
 		return nil, fmt.Errorf("redis connection failed: %w", err)
 	}
 
@@ -108,23 +109,31 @@ func New(redisAddr string) (*Collector, error) {
 	}, nil
 }
 
+func (c *Collector) Close() error {
+	return c.redisClient.Close()
+}
+
 func (c *Collector) Start(ctx context.Context) {
 	log.Println("Starting network collector...")
-
-	// Start packet capture for each interface
+	var wg sync.WaitGroup
 	for _, iface := range c.interfaces {
-		go c.capturePackets(ctx, iface)
+		wg.Add(1)
+		go func(name string) {
+			defer wg.Done()
+			c.capturePackets(ctx, name)
+		}(iface)
 	}
-
-	// Start continuous batch processor
-	go c.startBatchProcessor(ctx)
-
-	// Start periodic sender for batched metrics
-	go c.startPeriodicSender(ctx)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		c.startBatchProcessor(ctx)
+	}()
+	<-ctx.Done()
+	wg.Wait()
 }
 
 func (c *Collector) capturePackets(ctx context.Context, iface string) {
-	handle, err := pcap.OpenLive(iface, 1600, false, pcap.BlockForever)
+	handle, err := pcap.OpenLive(iface, 1600, false, 500*time.Millisecond)
 	if err != nil {
 		log.Printf("Failed to open interface %s: %v", iface, err)
 		return
@@ -141,7 +150,10 @@ func (c *Collector) capturePackets(ctx context.Context, iface string) {
 		select {
 		case <-ctx.Done():
 			return
-		case packet := <-packetSource.Packets():
+		case packet, ok := <-packetSource.Packets():
+			if !ok {
+				return
+			}
 			if packet != nil {
 				if err := c.processPacket(ctx, packet); err != nil {
 					log.Printf("Failed to process packet: %v", err)
@@ -215,7 +227,11 @@ func (c *Collector) startBatchProcessor(ctx context.Context) {
 			if err := c.processNextBatch(ctx); err != nil {
 				if err != redis.Nil {
 					log.Printf("Batch processing error: %v", err)
-					time.Sleep(time.Second) // Back off on errors
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(time.Second):
+					}
 				}
 			}
 		}
@@ -275,56 +291,13 @@ func (c *Collector) processNextBatch(ctx context.Context) error {
 		InterfaceStats: interfaceStats,
 	}
 
-	// Store processed metrics
-	data, err := json.Marshal(metrics)
-	if err != nil {
-		return fmt.Errorf("failed to marshal metrics: %w", err)
-	}
-
-	// Store in processed queue for batch sending
-	pipe := c.redisClient.Pipeline()
-	pipe.LPush(ctx, processedQueue, data)
-	pipe.LTrim(ctx, processedQueue, 0, maxQueueLength-1)
-	_, err = pipe.Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to store processed metrics: %w", err)
-	}
-
-	// Send to real-time channel
+	// The agent's transport owns outgoing buffering. Do not duplicate it into
+	// an unconsumed Redis list and delete it on a timer.
 	select {
 	case c.metrics <- metrics:
-	default:
-		log.Printf("Metrics channel full, skipping real-time update")
-	}
-
-	return nil
-}
-
-func (c *Collector) startPeriodicSender(ctx context.Context) {
-	// #TODO: The periodic sender is totaly dependent on the network flow speed
-	// so it should dynamically adjust the interval based on the number of
-	// packets processed.
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			results, err := c.redisClient.LRange(ctx, processedQueue, 0, -1).Result()
-			if err != nil {
-				log.Printf("Failed to get processed metrics: %v", err)
-				continue
-			}
-
-			if len(results) > 0 {
-				if err := c.redisClient.Del(ctx, processedQueue).Err(); err != nil {
-					log.Printf("Failed to clear processed queue: %v", err)
-				}
-				log.Printf("Sending batch of %d processed network metrics sets", len(results))
-			}
-		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
