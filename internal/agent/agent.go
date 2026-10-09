@@ -91,6 +91,12 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 	defer a.tunnel.Close()
 
+	// The initial inventory must exist before the first log_list and before
+	// processing remote searches; otherwise the first update may take minutes.
+	if err := a.logCollector.Refresh(ctx); err != nil {
+		return fmt.Errorf("discover initial logs: %w", err)
+	}
+
 	log.Println("Starting collectors...")
 	go a.logCollector.Start(ctx)
 	go a.networkCollector.Start(ctx)
