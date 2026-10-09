@@ -83,6 +83,7 @@ func New(redisAddr string) (*Collector, error) {
 	defer cancel()
 
 	if err := rdb.Ping(ctx).Err(); err != nil {
+		_ = rdb.Close()
 		return nil, fmt.Errorf("redis connection failed: %w", err)
 	}
 
@@ -105,6 +106,10 @@ func New(redisAddr string) (*Collector, error) {
 		lastProcessed: time.Now(),
 		statsInterval: 5 * time.Second,
 	}, nil
+}
+
+func (c *Collector) Close() error {
+	return c.redisClient.Close()
 }
 
 func (c *Collector) Start(ctx context.Context) {
