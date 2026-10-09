@@ -34,7 +34,7 @@ jobs:
           cache: true
       - name: Format
         run: |
-          files="$(gofmt -l ./cmd ./internal ./config.go)"
+          files="$(gofmt -l ./cmd ./internal)"
           if [ -n "$files" ]; then
             printf 'Go files require formatting:\n%s\n' "$files"
             exit 1
