@@ -18,7 +18,6 @@ import (
 
 const (
 	packetQueue    = "network:packets:queue"   // Raw packets waiting to be processed
-	processedQueue = "network:processed:queue" // Processed metrics ready for client consumption
 	batchSize      = 1000
 	maxQueueLength = 10000
 )
@@ -119,8 +118,6 @@ func (c *Collector) Start(ctx context.Context) {
 	// Start continuous batch processor
 	go c.startBatchProcessor(ctx)
 
-	// Start periodic sender for batched metrics
-	go c.startPeriodicSender(ctx)
 }
 
 func (c *Collector) capturePackets(ctx context.Context, iface string) {
@@ -215,7 +212,11 @@ func (c *Collector) startBatchProcessor(ctx context.Context) {
 			if err := c.processNextBatch(ctx); err != nil {
 				if err != redis.Nil {
 					log.Printf("Batch processing error: %v", err)
-					time.Sleep(time.Second) // Back off on errors
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(time.Second):
+					}
 				}
 			}
 		}
@@ -275,56 +276,13 @@ func (c *Collector) processNextBatch(ctx context.Context) error {
 		InterfaceStats: interfaceStats,
 	}
 
-	// Store processed metrics
-	data, err := json.Marshal(metrics)
-	if err != nil {
-		return fmt.Errorf("failed to marshal metrics: %w", err)
-	}
-
-	// Store in processed queue for batch sending
-	pipe := c.redisClient.Pipeline()
-	pipe.LPush(ctx, processedQueue, data)
-	pipe.LTrim(ctx, processedQueue, 0, maxQueueLength-1)
-	_, err = pipe.Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to store processed metrics: %w", err)
-	}
-
-	// Send to real-time channel
+	// The agent's transport owns outgoing buffering. Do not duplicate it into
+	// an unconsumed Redis list and delete it on a timer.
 	select {
 	case c.metrics <- metrics:
-	default:
-		log.Printf("Metrics channel full, skipping real-time update")
-	}
-
-	return nil
-}
-
-func (c *Collector) startPeriodicSender(ctx context.Context) {
-	// #TODO: The periodic sender is totaly dependent on the network flow speed
-	// so it should dynamically adjust the interval based on the number of
-	// packets processed.
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			results, err := c.redisClient.LRange(ctx, processedQueue, 0, -1).Result()
-			if err != nil {
-				log.Printf("Failed to get processed metrics: %v", err)
-				continue
-			}
-
-			if len(results) > 0 {
-				if err := c.redisClient.Del(ctx, processedQueue).Err(); err != nil {
-					log.Printf("Failed to clear processed queue: %v", err)
-				}
-				log.Printf("Sending batch of %d processed network metrics sets", len(results))
-			}
-		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
