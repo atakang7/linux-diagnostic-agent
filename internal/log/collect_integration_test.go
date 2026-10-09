@@ -51,7 +51,7 @@ func TestRedisBackedLogSearchAndDiscovery(t *testing.T) {
 		t.Fatalf("unexpected inventory: %+v", inventory)
 	}
 	if err := c.ProcessFiles(ctx, FileProcessRequest{
-		Files: []string{plain, compressed},
+		Files:    []string{plain, compressed},
 		Keywords: []string{"ERROR"},
 	}); err != nil {
 		t.Fatal(err)
