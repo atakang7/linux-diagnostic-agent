@@ -129,7 +129,7 @@ func (a *Agent) handleCommands(ctx context.Context) {
 			return
 		case raw := <-a.tunnel.Commands():
 			var msg struct {
-				Type MessageType `json:"type"`
+				Type    MessageType     `json:"type"`
 				Payload json.RawMessage `json:"payload"`
 			}
 			if err := json.Unmarshal(raw, &msg); err != nil {
