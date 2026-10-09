@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"log"
 	"strings"
-	"time"
 	"sync"
+	"time"
 
 	"github.com/go-redis/redis/v8"
 	"github.com/google/gopacket"
