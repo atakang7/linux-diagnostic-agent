@@ -37,12 +37,6 @@ jobs:
           files="$(gofmt -l ./cmd ./internal ./config.go)"
           if [ -n "$files" ]; then
             printf 'Go files require formatting:\n%s\n' "$files"
-            for file in $files; do
-              echo "FORMATTED_BEGIN:$file"
-              gofmt "$file" | base64 -w 0
-              echo
-              echo "FORMATTED_END:$file"
-            done
             exit 1
           fi
       - name: Dependency integrity
