@@ -34,8 +34,8 @@ func New(hostAddr string) *Tunnel {
 		hostAddr: hostAddr,
 		sendChan: make(chan []byte, 1000),
 		commands: make(chan json.RawMessage, 128),
-		ctx: ctx,
-		cancel: cancel,
+		ctx:      ctx,
+		cancel:   cancel,
 	}
 }
 
