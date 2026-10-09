@@ -62,6 +62,7 @@ func New(hostAddr, redisAddr string) (*Agent, error) {
 
 	logCollector, err := logcollect.New(redisAddr)
 	if err != nil {
+		_ = networkCollector.Close()
 		return nil, fmt.Errorf("failed to create log collector: %w", err)
 	}
 
@@ -90,6 +91,8 @@ func (a *Agent) Run(ctx context.Context) error {
 		return fmt.Errorf("failed to connect tunnel: %w", err)
 	}
 	defer a.tunnel.Close()
+	defer a.logCollector.Close()
+	defer a.networkCollector.Close()
 
 	// The initial inventory must exist before the first log_list and before
 	// processing remote searches; otherwise the first update may take minutes.
@@ -98,8 +101,16 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 
 	log.Println("Starting collectors...")
-	go a.logCollector.Start(ctx)
-	go a.networkCollector.Start(ctx)
+	var collectors sync.WaitGroup
+	collectors.Add(2)
+	go func() {
+		defer collectors.Done()
+		a.logCollector.Start(ctx)
+	}()
+	go func() {
+		defer collectors.Done()
+		a.networkCollector.Start(ctx)
+	}()
 	var wg sync.WaitGroup
 	wg.Add(3)
 
@@ -119,6 +130,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	}()
 
 	wg.Wait()
+	collectors.Wait()
 	return nil
 }
 
