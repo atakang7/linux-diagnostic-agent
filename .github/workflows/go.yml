@@ -40,7 +40,9 @@ jobs:
             exit 1
           fi
       - name: Dependency integrity
-        run: go mod verify
+        run: |
+          go mod verify
+          go mod tidy -diff
       - name: Build
         run: make build
       - name: Vet
