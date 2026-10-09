@@ -50,6 +50,7 @@ type LogEntry struct {
 	LineNum   int              `json:"line_num"`
 	Timestamp time.Time        `json:"timestamp"`
 	Type      NotificationType `json:"notification_type"`
+	Level     string           `json:"level"`
 }
 
 type FileProcessRequest struct {
@@ -245,6 +246,7 @@ func (c *Collector) processFile(ctx context.Context, filePath string, keywords [
 						LineNum:   lineNum,
 						Timestamp: time.Now(),
 						Type:      getNotificationType(keyword),
+						Level:     string(getNotificationType(keyword)),
 					})
 					break
 				}
@@ -271,9 +273,9 @@ func (c *Collector) processFile(ctx context.Context, filePath string, keywords [
 }
 
 func getNotificationType(keyword string) NotificationType {
-	if keyword == "error" {
+	if strings.EqualFold(keyword, "error") {
 		return Error
-	} else if keyword == "warning" {
+	} else if strings.EqualFold(keyword, "warning") {
 		return Warning
 	}
 	return Other
