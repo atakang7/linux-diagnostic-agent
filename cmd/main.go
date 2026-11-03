@@ -1,4 +1,3 @@
-// cmd/main.go
 package main
 
 import (
@@ -22,24 +21,13 @@ func main() {
 		redisAddr = "localhost:6379"
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
 	a, err := agent.New(hostAddr, redisAddr)
 	if err != nil {
 		log.Fatalf("Failed to initialize agent: %v", err)
 	}
-
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
-	go func() {
-		<-sigChan
-		log.Println("Shutting down...")
-		cancel()
-	}()
-
-	// Run agent
 	if err := a.Run(ctx); err != nil {
 		log.Fatalf("Agent error: %v", err)
 	}
