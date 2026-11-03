@@ -19,7 +19,7 @@ import (
 )
 
 const (
-	chunkSize            = 10 * 1024 * 1024 // Maximum log line size
+	chunkSize            = 10 * 1024 * 1024 // 10MB chunks for processing
 	maxBatchSize         = 1000
 	deliveryRateLimit    = 1 * time.Second // Time between sending batches to client
 	redisKeyExpiry       = 24 * time.Hour  // How long to keep results in Redis
@@ -154,9 +154,7 @@ func (c *Collector) ProcessFiles(ctx context.Context, req FileProcessRequest) er
 	if err := c.redisClient.HSet(ctx, metaKey, meta).Err(); err != nil {
 		return fmt.Errorf("store search metadata: %w", err)
 	}
-	if err := c.redisClient.Expire(ctx, metaKey, redisKeyExpiry).Err(); err != nil {
-		return fmt.Errorf("set search metadata expiry: %w", err)
-	}
+	_ = c.redisClient.Expire(ctx, metaKey, redisKeyExpiry).Err()
 
 	// Bounded per-search workers avoid races between concurrent requests.
 	workers := len(req.Files)
@@ -200,7 +198,7 @@ func (c *Collector) ProcessFiles(ctx context.Context, req FileProcessRequest) er
 	if len(failures) > 0 {
 		status = "failed"
 	}
-	metaErr := c.redisClient.HSet(ctx, metaKey, map[string]interface{}{
+	_ = c.redisClient.HSet(ctx, metaKey, map[string]interface{}{
 		"status":   status,
 		"end_time": time.Now().UTC().Format(time.RFC3339),
 		"errors":   strings.Join(failures, "; "),
@@ -208,9 +206,6 @@ func (c *Collector) ProcessFiles(ctx context.Context, req FileProcessRequest) er
 	go c.startConsumer(ctx, searchID)
 	if len(failures) > 0 {
 		return fmt.Errorf("search errors: %s", strings.Join(failures, "; "))
-	}
-	if metaErr != nil {
-		return fmt.Errorf("update search metadata: %w", metaErr)
 	}
 	return nil
 }
@@ -236,8 +231,9 @@ func (c *Collector) processFile(ctx context.Context, filePath string, keywords [
 	lineNum := 0
 	var bytesScanned int
 	scanner := bufio.NewScanner(reader)
-	scanner.Buffer(make([]byte, 64*1024), chunkSize)
+	scanner.Buffer(make([]byte, chunkSize), chunkSize)
 
+	// Expensive search
 	for scanner.Scan() {
 		select {
 		case <-ctx.Done():
@@ -306,10 +302,8 @@ func (c *Collector) bufferBatch(ctx context.Context, entries []LogEntry, searchI
 		return fmt.Errorf("failed to store in Redis: %w", err)
 	}
 
-	if err := c.redisClient.Expire(ctx, key, redisKeyExpiry).Err(); err != nil {
-		return fmt.Errorf("set search result expiry: %w", err)
-	}
-	c.updateBufferStats()
+	c.redisClient.Expire(ctx, key, redisKeyExpiry)
+	c.updateBufferStats(len(entries))
 	return nil
 }
 
@@ -331,7 +325,7 @@ func (c *Collector) startConsumer(ctx context.Context, searchID string) {
 			}
 			select {
 			case c.logChan <- entries:
-				c.updateDeliveryStats()
+				c.updateDeliveryStats(len(entries))
 			case <-ctx.Done():
 				return
 			}
@@ -381,9 +375,7 @@ func (c *Collector) updateLogFiles(ctx context.Context) error {
 	if err := json.NewEncoder(gz).Encode(files); err != nil {
 		return fmt.Errorf("failed to encode files: %w", err)
 	}
-	if err := gz.Close(); err != nil {
-		return fmt.Errorf("finish compressed inventory: %w", err)
-	}
+	gz.Close()
 
 	return c.redisClient.Set(ctx, "log_files", buf.Bytes(), redisKeyExpiry).Err()
 }
@@ -396,13 +388,13 @@ func (c *Collector) updateStats(lineCount, batchSize int) {
 	c.stats.ProcessedFiles++
 }
 
-func (c *Collector) updateBufferStats() {
+func (c *Collector) updateBufferStats(count int) {
 	c.statsMutex.Lock()
 	defer c.statsMutex.Unlock()
 	c.stats.BufferedBatches++
 }
 
-func (c *Collector) updateDeliveryStats() {
+func (c *Collector) updateDeliveryStats(count int) {
 	c.statsMutex.Lock()
 	defer c.statsMutex.Unlock()
 	c.stats.DeliveredBatches++
@@ -447,6 +439,7 @@ func (c *Collector) GetDiscoveredFiles() []LogFile {
 	return files
 }
 
+// Helper functions for system metrics
 func isLogFile(path string) bool {
 	ext := strings.ToLower(filepath.Ext(path))
 	return ext == ".log" || ext == ".txt" || strings.HasSuffix(strings.ToLower(path), ".log.gz")
