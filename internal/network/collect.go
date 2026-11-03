@@ -90,7 +90,6 @@ func New(redisAddr string) (*Collector, error) {
 
 	interfaces, err := pcap.FindAllDevs()
 	if err != nil {
-		_ = rdb.Close()
 		return nil, fmt.Errorf("failed to get interfaces: %w", err)
 	}
 
@@ -179,6 +178,8 @@ func (c *Collector) processPacket(ctx context.Context, packet gopacket.Packet) e
 		DstIP:     ip.DstIP.String(),
 	}
 
+	// Set default payload size
+	packetInfo.PayloadSize = 0
 	if appLayer := packet.ApplicationLayer(); appLayer != nil {
 		packetInfo.PayloadSize = len(appLayer.Payload())
 	}
@@ -241,17 +242,14 @@ func (c *Collector) processNextBatch(ctx context.Context) error {
 	// Atomically get and remove a batch of packets
 	var packets []PacketInfo
 
+	// Use RPOP for atomic removal of processed packets
 	results, err := c.redisClient.LPopCount(ctx, packetQueue, batchSize).Result()
-	if err != nil && err != redis.Nil {
-		return fmt.Errorf("failed to pop packets: %w", err)
-	}
 	if err == redis.Nil || len(results) == 0 {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(100 * time.Millisecond):
-			return redis.Nil
-		}
+		time.Sleep(100 * time.Millisecond) // Prevent tight loop when no packets
+		return redis.Nil
+	}
+	if err != nil {
+		return fmt.Errorf("failed to pop packets: %w", err)
 	}
 
 	// Process the batch
