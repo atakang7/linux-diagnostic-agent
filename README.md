@@ -2,6 +2,21 @@
 
 Linux collector for log searches and IPv4 network metrics; it uses Redis for buffering and sends newline-delimited JSON to [linux-diagnostic-client](https://github.com/atakang7/linux-diagnostic-client) over TCP.
 
+```text
++-------------------+        +---------------+
+| network.Collector |        | log.Collector |
++-------------------+        +---------------+
+         |                          |
+       metrics                    log_data
+         |                          |
+         +-------------+------------+
+                       |
+                       v
+                +-------------+ messages +---------------+ TCP +-------------------+
+                | agent.Agent | --------> | tunnel.Tunnel | ---> | diagnostic-client |
+                +-------------+          +---------------+      +-------------------+
+```
+
 ## Run
 
 Requires Linux, Go 1.23.2+, Redis, and libpcap headers; start the diagnostic client listener first.
@@ -44,6 +59,24 @@ make build
 make vet
 make test
 go test -race -tags=integration -count=1 ./...
+```
+
+```text
++-----------+ trigger +------------------+ source +------------------+
+| push / PR | ------> | actions/checkout | -----> | actions/setup-go |
++-----------+         +------------------+        +------------------+
+                                                        |
+                                                      checks
+                                                        v
+                                               +--------------------+
+                                               | fmt mod build vet  |
+                                               +--------------------+
+                                                        |
+                                                       tests
+                                                        v
+                                               +--------------------+
+                                               | unit / Redis tests |
+                                               +--------------------+
 ```
 
 Integration tests require Redis at `127.0.0.1:6379`; CI starts it automatically.
