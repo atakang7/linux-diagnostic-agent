@@ -1,6 +1,12 @@
 package network
 
-import "testing"
+import (
+	"context"
+	"errors"
+	"testing"
+
+	"github.com/go-redis/redis/v8"
+)
 
 func TestIsNetworkInterface(t *testing.T) {
 	cases := []struct {
@@ -24,5 +30,16 @@ func TestIsNetworkInterface(t *testing.T) {
 				t.Fatalf("isNetworkInterface(%q) = %v, want %v", tc.name, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestProcessNextBatchReportsRedisFailure(t *testing.T) {
+	client := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6379"})
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+	collector := &Collector{redisClient: client}
+	if err := collector.processNextBatch(context.Background()); err == nil || errors.Is(err, redis.Nil) {
+		t.Fatalf("expected Redis error, got %v", err)
 	}
 }

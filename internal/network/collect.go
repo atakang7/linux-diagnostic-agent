@@ -90,6 +90,7 @@ func New(redisAddr string) (*Collector, error) {
 
 	interfaces, err := pcap.FindAllDevs()
 	if err != nil {
+		_ = rdb.Close()
 		return nil, fmt.Errorf("failed to get interfaces: %w", err)
 	}
 
@@ -143,6 +144,7 @@ func (c *Collector) capturePackets(ctx context.Context, iface string) {
 	err = handle.SetBPFFilter("tcp or udp or icmp")
 	if err != nil {
 		log.Printf("Failed to set BPF filter on %s: %v", iface, err)
+		return
 	}
 
 	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
@@ -244,12 +246,12 @@ func (c *Collector) processNextBatch(ctx context.Context) error {
 
 	// Use RPOP for atomic removal of processed packets
 	results, err := c.redisClient.LPopCount(ctx, packetQueue, batchSize).Result()
+	if err != nil && err != redis.Nil {
+		return fmt.Errorf("failed to pop packets: %w", err)
+	}
 	if err == redis.Nil || len(results) == 0 {
 		time.Sleep(100 * time.Millisecond) // Prevent tight loop when no packets
 		return redis.Nil
-	}
-	if err != nil {
-		return fmt.Errorf("failed to pop packets: %w", err)
 	}
 
 	// Process the batch
