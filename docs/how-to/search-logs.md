@@ -6,4 +6,3 @@
 4. Send a `log_search` command with that path in `files` and a search term in `keywords`, using the [command format](../reference/protocol.md#inbound-command).
 5. Read the returned `log_data` batches from the same TCP connection.
 
-Searches accept one to 128 inventoried files and one to 16 keywords.

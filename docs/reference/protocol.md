@@ -1,6 +1,6 @@
 # TCP protocol
 
-The agent connects to the diagnostic client's TCP listener. Frames are UTF-8 JSON objects separated by newline characters; the receiver must accept a one-megabyte incoming command limit.
+The agent connects to the diagnostic client's TCP listener. Frames are UTF-8 JSON objects separated by newline characters. The agent caps incoming frames at 1 MiB.
 
 ## Inbound command
 
