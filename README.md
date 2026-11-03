@@ -1,6 +1,6 @@
 # linux-diagnostic-agent
 
-Go collector for Linux hosts that sends log searches and network telemetry to the [diagnostic client](https://github.com/atakang7/linux-diagnostic-client).
+Go collector for Linux hosts that returns log search results and sends network telemetry to the [diagnostic client](https://github.com/atakang7/linux-diagnostic-client).
 
 ```text
 +---------+  batches  +-------+   JSON   +--------+   TCP   +-------------------+
