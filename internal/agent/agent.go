@@ -1,4 +1,3 @@
-// internal/agent/agent.go
 package agent
 
 import (
@@ -21,7 +20,6 @@ const (
 	TypeLogList   MessageType = "log_list"
 	TypeLogData   MessageType = "log_data"
 	TypeLogSearch MessageType = "log_search"
-	TypeCommand   MessageType = "command"
 )
 
 type Message struct {
@@ -48,7 +46,6 @@ type Agent struct {
 	networkCollector *network.Collector
 	logCollector     *logcollect.Collector
 	tunnel           *tunnel.Tunnel
-	redisAddr        string
 	activeSearches   sync.WaitGroup
 	stats            AgentStats
 	statsMutex       sync.RWMutex
@@ -70,29 +67,17 @@ func New(hostAddr, redisAddr string) (*Agent, error) {
 		networkCollector: networkCollector,
 		logCollector:     logCollector,
 		tunnel:           tunnel.New(hostAddr),
-		redisAddr:        redisAddr,
 	}, nil
 }
 
 func (a *Agent) Run(ctx context.Context) error {
-	log.Println(`
-	_____
-   /     \
-  /       \
- /_________\
-|          |
-|  Diagnostic |
-|   Agent   |
-|__________|
-	`)
-
-	// Connect tunnel
-	if err := a.tunnel.Connect(ctx); err != nil {
-		return fmt.Errorf("failed to connect tunnel: %w", err)
-	}
 	defer a.tunnel.Close()
 	defer a.logCollector.Close()
 	defer a.networkCollector.Close()
+
+	if err := a.tunnel.Connect(ctx); err != nil {
+		return fmt.Errorf("failed to connect tunnel: %w", err)
+	}
 
 	// The initial inventory must exist before the first log_list and before
 	// processing remote searches; otherwise the first update may take minutes.
@@ -275,7 +260,11 @@ func (a *Agent) handleLogs(ctx context.Context) {
 						break
 					}
 					backoff := time.Duration(1<<attempt) * time.Second
-					time.Sleep(backoff)
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(backoff):
+					}
 					continue
 				}
 
@@ -331,7 +320,6 @@ func (a *Agent) handleLogs(ctx context.Context) {
 	}
 }
 
-// Stats management
 func (a *Agent) updateStats(updater func(*AgentStats)) {
 	a.statsMutex.Lock()
 	defer a.statsMutex.Unlock()
